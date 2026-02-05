@@ -1,0 +1,16 @@
+# CEX data collection
+ccxt>=4.0.0
+
+# Database
+asyncpg>=0.29.0
+
+# Web3 for DEX
+web3>=6.0.0
+eth-abi>=4.0.0
+eth-account>=0.10.0
+
+# Environment
+python-dotenv>=1.0.0
+
+# Utilities
+aiohttp>=3.9.0

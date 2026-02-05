@@ -1,0 +1,22 @@
+# Environment variables
+.env
+
+# Python
+__pycache__/
+*.pyc
+venv/
+
+# Logs
+*.log
+log
+
+# IDE
+.idea/
+.vscode/
+
+# macOS
+.DS_Store
+
+# Keys
+*.pem
+*.pub
