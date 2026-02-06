@@ -356,24 +356,30 @@ class PriceCollector:
             spot_data = None
             futures_data = None
             
-            # 分别获取现货和合约数据（使用不同的交易对）
-            if include_spot and spot_symbol:
-                try:
-                    # For Binance Alpha, spot_remote_id stores alpha_id (e.g., "ALPHA_175")
-                    alpha_id = task.get('spot_remote_id') if exchange_name.lower() == 'alpha' else None
-                    spot_data = await collector.get_spot_price(spot_symbol, alpha_id=alpha_id)
-                except Exception as e:
-                    import traceback
-                    logger.warning(f"[{exchange_name}] Failed to get spot for {spot_symbol}: {type(e).__name__}: {e}")
-                    logger.debug(f"[{exchange_name}] Spot error traceback:\n{traceback.format_exc()}")
+            # 并行获取现货和合约数据
+            async def fetch_spot():
+                if include_spot and spot_symbol:
+                    try:
+                        alpha_id = task.get('spot_remote_id') if exchange_name.lower() == 'alpha' else None
+                        return await collector.get_spot_price(spot_symbol, alpha_id=alpha_id)
+                    except Exception as e:
+                        import traceback
+                        logger.warning(f"[{exchange_name}] Failed to get spot for {spot_symbol}: {type(e).__name__}: {e}")
+                        logger.debug(f"[{exchange_name}] Spot error traceback:\n{traceback.format_exc()}")
+                return None
             
-            if include_futures and fut_symbol:
-                try:
-                    futures_data = await collector.get_futures_price(fut_symbol)
-                except Exception as e:
-                    import traceback
-                    logger.warning(f"[{exchange_name}] Failed to get futures for {fut_symbol}: {type(e).__name__}: {e}")
-                    logger.debug(f"[{exchange_name}] Futures error traceback:\n{traceback.format_exc()}")
+            async def fetch_futures():
+                if include_futures and fut_symbol:
+                    try:
+                        return await collector.get_futures_price(fut_symbol)
+                    except Exception as e:
+                        import traceback
+                        logger.warning(f"[{exchange_name}] Failed to get futures for {fut_symbol}: {type(e).__name__}: {e}")
+                        logger.debug(f"[{exchange_name}] Futures error traceback:\n{traceback.format_exc()}")
+                return None
+            
+            # 并行执行
+            spot_data, futures_data = await asyncio.gather(fetch_spot(), fetch_futures())
             
             # 构建价格数据
             data = CexPriceData(

@@ -209,43 +209,59 @@ class BinanceCollector(CcxtCollector):
     
     async def get_futures_price(self, symbol: str) -> FuturesData:
         """
-        Fetch futures data for Binance with funding interval
-        Uses premiumIndex API to get mark/index prices (not available in ticker)
+        Fetch futures data for Binance with funding interval (parallel requests)
+        Optimized: premiumIndex returns fundingRate, so no need for separate fetch_funding_rate
         """
         ccxt_symbol = unified_to_ccxt_swap_symbol(symbol)
+        parts = symbol.upper().split('_')
+        binance_symbol = f"{parts[0]}{parts[1]}" if len(parts) == 2 else symbol.replace('/', '').replace(':', '')
         
-        # Fetch ticker data
-        ticker = await self.futures_exchange.fetch_ticker(ccxt_symbol)
+        # Define async tasks (3 requests instead of 4)
+        async def fetch_ticker():
+            return await self.futures_exchange.fetch_ticker(ccxt_symbol)
         
-        # Fetch funding rate
-        funding_rate = None
-        try:
-            funding_info = await self.futures_exchange.fetch_funding_rate(ccxt_symbol)
-            funding_rate = Decimal(str(funding_info['fundingRate'])) if funding_info.get('fundingRate') else None
-        except Exception:
-            pass
+        async def fetch_premium_index():
+            # Returns: markPrice, indexPrice, lastFundingRate, nextFundingTime
+            try:
+                client = await self._get_httpx_client()
+                resp = await client.get(f"https://fapi.binance.com/fapi/v1/premiumIndex?symbol={binance_symbol}")
+                return resp.json() if resp.status_code == 200 else None
+            except Exception:
+                return None
         
-        # Fetch mark/index price from premiumIndex API (not available in ticker/24hr)
+        async def fetch_funding_info():
+            # Returns: fundingIntervalHours
+            try:
+                client = await self._get_httpx_client()
+                resp = await client.get(f"https://fapi.binance.com/fapi/v1/fundingInfo")
+                return resp.json() if resp.status_code == 200 else None
+            except Exception:
+                return None
+        
+        # Execute all requests in parallel (3 requests)
+        ticker, premium_data, funding_info_data = await asyncio.gather(
+            fetch_ticker(), fetch_premium_index(), fetch_funding_info()
+        )
+        
+        # Parse from premiumIndex: markPrice, indexPrice, fundingRate
         mark_price = None
         index_price = None
-        try:
-            # Convert symbol to Binance format (space_usdt -> SPACEUSDT)
-            parts = symbol.upper().split('_')
-            binance_symbol = f"{parts[0]}{parts[1]}" if len(parts) == 2 else symbol.replace('/', '').replace(':', '')
-            
-            client = await self._get_httpx_client()
-            resp = await client.get(f"https://fapi.binance.com/fapi/v1/premiumIndex?symbol={binance_symbol}")
-            if resp.status_code == 200:
-                data = resp.json()
-                if data.get('markPrice'):
-                    mark_price = Decimal(str(data['markPrice']))
-                if data.get('indexPrice'):
-                    index_price = Decimal(str(data['indexPrice']))
-        except Exception as e:
-            print(f"[binance] Failed to fetch premiumIndex: {e}")
+        funding_rate = None
+        if premium_data:
+            if premium_data.get('markPrice'):
+                mark_price = Decimal(str(premium_data['markPrice']))
+            if premium_data.get('indexPrice'):
+                index_price = Decimal(str(premium_data['indexPrice']))
+            if premium_data.get('lastFundingRate'):
+                funding_rate = Decimal(str(premium_data['lastFundingRate']))
         
-        # Binance default funding interval is 8h
-        funding_interval = "8h"
+        # Parse funding interval from fundingInfo
+        funding_interval = None
+        if funding_info_data:
+            for item in funding_info_data:
+                if item.get('symbol') == binance_symbol and item.get('fundingIntervalHours'):
+                    funding_interval = f"{item['fundingIntervalHours']}h"
+                    break
         
         return FuturesData(
             price=Decimal(str(ticker['last'])) if ticker.get('last') else None,
@@ -266,6 +282,85 @@ class BinanceCollector(CcxtCollector):
 class BitgetCollector(CcxtCollector):
     def __init__(self, cex_id: int = 1, config: Optional[Dict] = None):
         super().__init__(cex_id, 'bitget', config)
+        self._httpx_client = None
+    
+    async def _get_httpx_client(self):
+        """Lazy initialization of httpx client"""
+        if self._httpx_client is None:
+            self._httpx_client = httpx.AsyncClient(timeout=10.0)
+        return self._httpx_client
+    
+    async def get_futures_price(self, symbol: str) -> FuturesData:
+        """
+        Fetch futures data for Bitget with funding interval (parallel requests)
+        """
+        ccxt_symbol = unified_to_ccxt_swap_symbol(symbol)
+        parts = symbol.upper().split('_')
+        bitget_symbol = f"{parts[0]}{parts[1]}" if len(parts) == 2 else symbol.replace('/', '').replace(':', '')
+        
+        # Define async tasks
+        async def fetch_ticker():
+            return await self.futures_exchange.fetch_ticker(ccxt_symbol)
+        
+        async def fetch_funding():
+            try:
+                return await self.futures_exchange.fetch_funding_rate(ccxt_symbol)
+            except Exception as e:
+                print(f"[bitget] Failed to fetch funding info: {e}")
+                return None
+        
+        async def fetch_contract_info():
+            try:
+                client = await self._get_httpx_client()
+                resp = await client.get(f"https://api.bitget.com/api/v2/mix/market/contracts?productType=USDT-FUTURES&symbol={bitget_symbol}")
+                if resp.status_code == 200:
+                    return resp.json()
+            except Exception as e:
+                print(f"[bitget] Failed to fetch contract info: {e}")
+            return None
+        
+        # Execute all requests in parallel
+        ticker, funding_info, contract_data = await asyncio.gather(
+            fetch_ticker(), fetch_funding(), fetch_contract_info()
+        )
+        
+        # Parse funding rate
+        funding_rate = None
+        if funding_info and funding_info.get('fundingRate'):
+            funding_rate = Decimal(str(funding_info['fundingRate']))
+        
+        # Parse funding interval from contract info
+        funding_interval = None
+        if contract_data and contract_data.get('code') == '00000' and contract_data.get('data'):
+            for item in contract_data['data']:
+                if item.get('symbol') == bitget_symbol and item.get('fundInterval'):
+                    funding_interval = f"{item['fundInterval']}h"
+                    break
+        
+        # Get mark/index price from ticker info
+        mark_price = None
+        index_price = None
+        if ticker.get('info'):
+            info = ticker['info']
+            if info.get('markPrice'):
+                mark_price = Decimal(str(info['markPrice']))
+            if info.get('indexPrice'):
+                index_price = Decimal(str(info['indexPrice']))
+        
+        return FuturesData(
+            price=Decimal(str(ticker['last'])) if ticker.get('last') else None,
+            index_price=index_price,
+            mark_price=mark_price,
+            funding_rate=funding_rate,
+            funding_interval=funding_interval,
+        )
+    
+    async def close(self):
+        """Close exchange connections and httpx client"""
+        await super().close()
+        if self._httpx_client:
+            await self._httpx_client.aclose()
+            self._httpx_client = None
 
 
 class BybitCollector(CcxtCollector):
@@ -281,13 +376,28 @@ class BybitCollector(CcxtCollector):
         # Fetch ticker data
         ticker = await self.futures_exchange.fetch_ticker(ccxt_symbol)
         
-        # Fetch funding rate
+        # Fetch funding rate and interval
         funding_rate = None
+        funding_interval = None
         try:
             funding_info = await self.futures_exchange.fetch_funding_rate(ccxt_symbol)
             funding_rate = Decimal(str(funding_info['fundingRate'])) if funding_info.get('fundingRate') else None
-        except Exception:
-            pass
+            
+            # Try to get interval directly from raw info first (Bybit returns fundingInterval in minutes)
+            if funding_info.get('info'):
+                info = funding_info['info']
+                if info.get('fundingInterval'):
+                    interval_mins = int(info['fundingInterval'])
+                    interval_hours = interval_mins // 60
+                    funding_interval = f"{interval_hours}h"
+            
+            # Fallback: calculate from timestamps if no direct value
+            if not funding_interval and funding_info.get('fundingTimestamp') and funding_info.get('nextFundingTimestamp'):
+                interval_ms = funding_info['nextFundingTimestamp'] - funding_info['fundingTimestamp']
+                interval_hours = interval_ms // (1000 * 60 * 60)
+                funding_interval = f"{interval_hours}h"
+        except Exception as e:
+            print(f"[bybit] Failed to fetch funding info: {e}")
         
         # Get mark/index price
         mark_price = None
@@ -298,9 +408,6 @@ class BybitCollector(CcxtCollector):
                 mark_price = Decimal(str(info['markPrice']))
             if info.get('indexPrice'):
                 index_price = Decimal(str(info['indexPrice']))
-        
-        # Bybit default funding interval is 8h
-        funding_interval = "8h"
         
         return FuturesData(
             price=Decimal(str(ticker['last'])) if ticker.get('last') else None,
@@ -324,52 +431,74 @@ class OkxCollector(CcxtCollector):
     
     async def get_futures_price(self, symbol: str) -> FuturesData:
         """
-        Fetch futures data for OKX with mark price from dedicated API
+        Fetch futures data for OKX with mark price from dedicated API (parallel requests)
+        Optimized: funding-rate API returns fundingRate, so no need for separate fetch_funding_rate
         """
         ccxt_symbol = unified_to_ccxt_swap_symbol(symbol)
+        parts = symbol.upper().split('_')
+        base = parts[0] if len(parts) >= 1 else symbol
+        quote = parts[1] if len(parts) >= 2 else 'USDT'
+        okx_swap_id = f"{base}-{quote}-SWAP"
+        okx_index_id = f"{base}-{quote}"
         
-        # Fetch ticker data
-        ticker = await self.futures_exchange.fetch_ticker(ccxt_symbol)
+        # Define async tasks (4 requests instead of 5)
+        async def fetch_ticker():
+            return await self.futures_exchange.fetch_ticker(ccxt_symbol)
         
-        # Fetch funding rate
+        async def fetch_mark_price():
+            try:
+                client = await self._get_httpx_client()
+                resp = await client.get(f"https://www.okx.com/api/v5/public/mark-price?instType=SWAP&instId={okx_swap_id}")
+                return resp.json() if resp.status_code == 200 else None
+            except Exception:
+                return None
+        
+        async def fetch_index_price():
+            try:
+                client = await self._get_httpx_client()
+                resp = await client.get(f"https://www.okx.com/api/v5/market/index-tickers?instId={okx_index_id}")
+                return resp.json() if resp.status_code == 200 else None
+            except Exception:
+                return None
+        
+        async def fetch_funding_rate_api():
+            # Returns: fundingRate, fundingTime, nextFundingTime
+            try:
+                client = await self._get_httpx_client()
+                resp = await client.get(f"https://www.okx.com/api/v5/public/funding-rate?instId={okx_swap_id}")
+                return resp.json() if resp.status_code == 200 else None
+            except Exception:
+                return None
+        
+        # Execute all requests in parallel (4 requests)
+        ticker, mark_data, index_data, fr_data = await asyncio.gather(
+            fetch_ticker(), fetch_mark_price(), fetch_index_price(), fetch_funding_rate_api()
+        )
+        
+        # Parse mark price
+        mark_price = None
+        if mark_data and mark_data.get('code') == '0' and mark_data.get('data'):
+            mark_price = Decimal(str(mark_data['data'][0]['markPx']))
+        
+        # Parse index price
+        index_price = None
+        if index_data and index_data.get('code') == '0' and index_data.get('data'):
+            index_price = Decimal(str(index_data['data'][0]['idxPx']))
+        
+        # Parse funding rate and interval from funding-rate API
         funding_rate = None
         funding_interval = None
-        try:
-            funding_info = await self.futures_exchange.fetch_funding_rate(ccxt_symbol)
-            funding_rate = Decimal(str(funding_info['fundingRate'])) if funding_info.get('fundingRate') else None
-            # OKX funding interval is typically 8h
-            funding_interval = "8h"
-        except Exception:
-            pass
-        
-        # Fetch mark price and index price from OKX API (not available in ticker)
-        mark_price = None
-        index_price = None
-        try:
-            # Convert symbol to OKX format
-            parts = symbol.upper().split('_')
-            base = parts[0] if len(parts) >= 1 else symbol
-            quote = parts[1] if len(parts) >= 2 else 'USDT'
-            okx_swap_id = f"{base}-{quote}-SWAP"  # For mark price
-            okx_index_id = f"{base}-{quote}"      # For index price
-            
-            client = await self._get_httpx_client()
-            
-            # Fetch mark price from /public/mark-price
-            resp1 = await client.get(f"https://www.okx.com/api/v5/public/mark-price?instType=SWAP&instId={okx_swap_id}")
-            if resp1.status_code == 200:
-                data = resp1.json()
-                if data.get('code') == '0' and data.get('data'):
-                    mark_price = Decimal(str(data['data'][0]['markPx']))
-            
-            # Fetch index price from /market/index-tickers
-            resp2 = await client.get(f"https://www.okx.com/api/v5/market/index-tickers?instId={okx_index_id}")
-            if resp2.status_code == 200:
-                data = resp2.json()
-                if data.get('code') == '0' and data.get('data'):
-                    index_price = Decimal(str(data['data'][0]['idxPx']))
-        except Exception as e:
-            print(f"[okx] Failed to fetch mark/index price: {e}")
+        if fr_data and fr_data.get('code') == '0' and fr_data.get('data'):
+            fr_info = fr_data['data'][0]
+            # Get funding rate
+            if fr_info.get('fundingRate'):
+                funding_rate = Decimal(str(fr_info['fundingRate']))
+            # Calculate funding interval
+            if fr_info.get('fundingTime') and fr_info.get('nextFundingTime'):
+                current_ts = int(fr_info['fundingTime'])
+                next_ts = int(fr_info['nextFundingTime'])
+                interval_hours = (next_ts - current_ts) // (1000 * 60 * 60)
+                funding_interval = f"{interval_hours}h"
         
         return FuturesData(
             price=Decimal(str(ticker['last'])) if ticker.get('last') else None,
@@ -390,6 +519,56 @@ class OkxCollector(CcxtCollector):
 class GateCollector(CcxtCollector):
     def __init__(self, cex_id: int = 4, config: Optional[Dict] = None):
         super().__init__(cex_id, 'gate', config)
+    
+    async def get_futures_price(self, symbol: str) -> FuturesData:
+        """
+        Fetch futures data for Gate with funding interval
+        """
+        ccxt_symbol = unified_to_ccxt_swap_symbol(symbol)
+        
+        # Fetch ticker data
+        ticker = await self.futures_exchange.fetch_ticker(ccxt_symbol)
+        
+        # Fetch funding rate and interval
+        funding_rate = None
+        funding_interval = None
+        try:
+            funding_info = await self.futures_exchange.fetch_funding_rate(ccxt_symbol)
+            funding_rate = Decimal(str(funding_info['fundingRate'])) if funding_info.get('fundingRate') else None
+            
+            # Try to get interval directly from raw info first (Gate returns funding_interval in seconds)
+            if funding_info.get('info'):
+                info = funding_info['info']
+                if info.get('funding_interval'):
+                    interval_secs = int(info['funding_interval'])
+                    interval_hours = interval_secs // 3600
+                    funding_interval = f"{interval_hours}h"
+            
+            # Fallback: calculate from timestamps if no direct value
+            if not funding_interval and funding_info.get('fundingTimestamp') and funding_info.get('nextFundingTimestamp'):
+                interval_ms = funding_info['nextFundingTimestamp'] - funding_info['fundingTimestamp']
+                interval_hours = interval_ms // (1000 * 60 * 60)
+                funding_interval = f"{interval_hours}h"
+        except Exception as e:
+            print(f"[gate] Failed to fetch funding info: {e}")
+        
+        # Get mark/index price from ticker info
+        mark_price = None
+        index_price = None
+        if ticker.get('info'):
+            info = ticker['info']
+            if info.get('mark_price'):
+                mark_price = Decimal(str(info['mark_price']))
+            if info.get('index_price'):
+                index_price = Decimal(str(info['index_price']))
+        
+        return FuturesData(
+            price=Decimal(str(ticker['last'])) if ticker.get('last') else None,
+            index_price=index_price,
+            mark_price=mark_price,
+            funding_rate=funding_rate,
+            funding_interval=funding_interval,
+        )
 
 
 class KrakenCollector(CcxtCollector):
