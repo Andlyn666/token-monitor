@@ -141,7 +141,7 @@ CREATE_MM_DEX_LATEST = """
 CREATE TABLE mm_dex_latest (
     exchange_id SMALLINT NOT NULL,         -- DEX ID (引用 exchanges 表)
     symbol VARCHAR(32) NOT NULL,           -- 统一币对标识 (例如 astr_usdt)
-    pool_address VARCHAR(42) NOT NULL,     -- 流动性池合约地址 (DEX 的唯一标识)
+    pool_address VARCHAR(66) NOT NULL,     -- 流动性池地址或V4 pair_id (bytes32=66字符)
     spot_price NUMERIC,                    -- 链上即时兑换价格
     timestamp TIMESTAMPTZ NOT NULL,        -- 数据采集时间
     -- 外键约束
@@ -156,7 +156,7 @@ CREATE_MM_DEX_HISTORICAL = """
 CREATE TABLE mm_dex_historical (
     exchange_id SMALLINT NOT NULL,         -- DEX ID (引用 exchanges 表)
     symbol VARCHAR(32) NOT NULL,
-    pool_address VARCHAR(42) NOT NULL,
+    pool_address VARCHAR(66) NOT NULL,     -- 流动性池地址或V4 pair_id (bytes32=66字符)
     spot_price NUMERIC,                    -- 链上即时兑换价格
     timestamp TIMESTAMPTZ NOT NULL,
     -- 分区表主键必须包含分区键 (timestamp)
@@ -261,4 +261,15 @@ ADD COLUMN IF NOT EXISTS fut_quote_token_id SMALLINT;
 
 ALTER TABLE config_monitoring_tasks 
 ADD COLUMN IF NOT EXISTS fut_remote_id VARCHAR(128);
+"""
+
+# 迁移语句：扩展 pool_address 字段长度以支持 V4 pair_id (bytes32)
+ALTER_POOL_ADDRESS_LENGTH = """
+-- 修改 mm_dex_latest 表的 pool_address 字段
+ALTER TABLE mm_dex_latest 
+ALTER COLUMN pool_address TYPE VARCHAR(66);
+
+-- 修改 mm_dex_historical 表的 pool_address 字段
+ALTER TABLE mm_dex_historical 
+ALTER COLUMN pool_address TYPE VARCHAR(66);
 """

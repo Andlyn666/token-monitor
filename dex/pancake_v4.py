@@ -13,12 +13,16 @@ class PancakeV4Dex:
     """
     PancakeSwap V4 DEX collector.
     Note: V4 uses a pool manager contract with pool IDs instead of individual pool contracts.
-    The pool_address parameter should be the pool manager address.
-    The pair_id should be passed in extra_params.
+    The pair_id parameter is the pool ID (bytes32 hex string).
+    The pool manager address is a protocol constant.
     """
-    def __init__(self, pool_mgr_address, quote_token_address='0x55d398326f99059fF775485246999027B3197955', web3=None, pair_id=None, base_token_address=None):
-        self.pool_mgr_address = Web3.to_checksum_address(pool_mgr_address)
-        self.pair_id = pair_id  # Pool ID for V4 pools
+    # PancakeSwap V4 Pool Manager on BSC
+    POOL_MGR_ADDRESS = '0xa0FfB9c1CE1Fe56963B0321B32E7A0302114058b'
+    
+    def __init__(self, pair_id, quote_token_address='0x55d398326f99059fF775485246999027B3197955', web3=None, base_token_address=None):
+        self.pool_mgr_address = Web3.to_checksum_address(self.POOL_MGR_ADDRESS)
+        # Convert pair_id string to bytes32
+        self.pair_id = Web3.to_bytes(hexstr=pair_id) if pair_id else None
         self.quote_token_address = Web3.to_checksum_address(quote_token_address)
         self.web3 = web3 or Web3(Web3.HTTPProvider(os.environ.get('BSC_RPC')))
         self.web3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)

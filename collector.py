@@ -231,8 +231,7 @@ class PriceCollector:
             from web3 import Web3
             web3 = Web3(Web3.HTTPProvider(rpc_url)) if rpc_url else None
             
-            # Get additional V4-specific params
-            pair_id = extra_params.get('pair_id')
+            # Get additional params from extra_params
             base_token_address = extra_params.get('base_token_address')
             
             collector = None
@@ -241,15 +240,15 @@ class PriceCollector:
                 collector = PancakeV3Dex(pool_address, quote_token_address, web3)
             elif dex_name == 'pancake_v4':
                 from dex.pancake_v4 import PancakeV4Dex
-                # V4 uses pool manager address (pool_address), needs pair_id and base_token_address
-                collector = PancakeV4Dex(pool_address, quote_token_address, web3, pair_id=pair_id, base_token_address=base_token_address)
+                # V4: pool_address is the pair_id, manager address is hardcoded in class
+                collector = PancakeV4Dex(pool_address, quote_token_address, web3, base_token_address=base_token_address)
             elif dex_name == 'uniswap_v3':
                 from dex.uniswap_v3 import UniswapV3Dex
                 collector = UniswapV3Dex(pool_address, quote_token_address, web3)
             elif dex_name == 'uniswap_v4':
                 from dex.uniswap_v4 import UniswapV4Dex
-                # V4 uses state view address (pool_address), needs pair_id and base_token_address
-                collector = UniswapV4Dex(pool_address, quote_token_address, web3, pair_id=pair_id, base_token_address=base_token_address)
+                # V4: pool_address is the pair_id, state view address is hardcoded in class
+                collector = UniswapV4Dex(pool_address, quote_token_address, web3, base_token_address=base_token_address)
             elif dex_name == 'aero_v3':
                 from dex.aerodrome_v3 import AerodromeV3Dex
                 collector = AerodromeV3Dex(pool_address, quote_token_address, web3)
