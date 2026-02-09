@@ -584,6 +584,55 @@ class KrakenCollector(CcxtCollector):
         futures_config['enableRateLimit'] = True
         futures_config['options'] = {'defaultType': 'swap'}
         self.futures_exchange = ccxt.krakenfutures(futures_config)
+    
+    async def get_futures_price(self, symbol: str) -> FuturesData:
+        """
+        Fetch futures data for Kraken Futures.
+        Krakenfutures returns markPrice instead of last price.
+        Funding interval is 1 hour for all Kraken perpetuals.
+        """
+        ccxt_symbol = unified_to_ccxt_swap_symbol(symbol)
+        
+        # Fetch ticker data
+        ticker = await self.futures_exchange.fetch_ticker(ccxt_symbol)
+        info = ticker.get('info', {})
+        
+        
+        # Kraken Futures uses markPrice as the price (no last/close available)
+        price = None
+        mark_price = None
+        index_price = None
+        
+        # Get markPrice (also used as the main price)
+        if info.get('markPrice'):
+            try:
+                mark_price = Decimal(str(info['markPrice']))
+                price = mark_price  # Use markPrice as fut_price
+            except:
+                pass
+        
+        # Get indexPrice
+        if info.get('indexPrice'):
+            try:
+                index_price = Decimal(str(info['indexPrice']))
+            except:
+                pass
+        
+        # Get funding rate (already in decimal format)
+        funding_rate = None
+        if info.get('fundingRate'):
+            try:
+                funding_rate = Decimal(str(info['fundingRate']))
+            except:
+                pass
+        
+        return FuturesData(
+            price=price,
+            index_price=index_price,
+            mark_price=mark_price,
+            funding_rate=funding_rate,
+            funding_interval='1h',  # Kraken Futures: 1 hour funding interval
+        )
 
 
 class AsterCollector(CcxtCollector):
