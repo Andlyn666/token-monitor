@@ -572,8 +572,18 @@ class GateCollector(CcxtCollector):
 
 
 class KrakenCollector(CcxtCollector):
+    """
+    Kraken collector with separate futures exchange (krakenfutures).
+    Kraken spot and futures are different platforms in CCXT.
+    """
     def __init__(self, cex_id: int = 5, config: Optional[Dict] = None):
         super().__init__(cex_id, 'kraken', config)
+        
+        # Override futures_exchange with krakenfutures (separate platform)
+        futures_config = config.copy() if config else {}
+        futures_config['enableRateLimit'] = True
+        futures_config['options'] = {'defaultType': 'swap'}
+        self.futures_exchange = ccxt.krakenfutures(futures_config)
 
 
 class AsterCollector(CcxtCollector):

@@ -21,8 +21,8 @@ from cex.ccxt_collector import create_cex_collector, CcxtCollector
 from dotenv import load_dotenv
 load_dotenv()
 
-# Configure logging
-log_level = logging.DEBUG if os.getenv('DEBUG') else logging.INFO
+# Configure logging (WARNING level by default, DEBUG if DEBUG env var is set)
+log_level = logging.DEBUG if os.getenv('DEBUG') else logging.WARNING
 logging.basicConfig(
     level=log_level,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',

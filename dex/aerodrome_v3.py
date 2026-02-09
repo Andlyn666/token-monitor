@@ -9,7 +9,7 @@ from dex.dex_base import DexBase
 from dex.util import sqrt_ratio_x96_to_price
 
 load_dotenv()
-logging.basicConfig(filename='log', level=logging.INFO)
+logging.basicConfig(filename='log', level=logging.WARNING)
 
 # ABI directory path
 _ABI_DIR = os.path.join(os.path.dirname(__file__), 'abi')

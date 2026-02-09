@@ -10,7 +10,7 @@ from web3.middleware import ExtraDataToPOAMiddleware
 from dex.dex_base import DexBase
 from dex.util import sqrt_ratio_x96_to_price
 load_dotenv()
-logging.basicConfig(filename='log', level=logging.INFO)
+logging.basicConfig(filename='log', level=logging.WARNING)
 
 class PancakeV3Dex(DexBase):
     def __init__(self, pair_address, quote_token_address='0x55d398326f99059fF775485246999027B3197955', web3=None):

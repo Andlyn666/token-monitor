@@ -9,7 +9,7 @@ from dex.dex_base import DexBase
 from dex.util import sqrt_ratio_x96_to_price
 
 load_dotenv()
-logging.basicConfig(filename='log', level=logging.INFO)
+logging.basicConfig(filename='log', level=logging.WARNING)
 
 class UniswapV3Dex(DexBase):
     def __init__(self, pair_address, quote_token_address='0xdAC17F958D2ee523a2206206994597C13D831ec7', web3=None):

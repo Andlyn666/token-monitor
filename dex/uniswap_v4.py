@@ -7,7 +7,7 @@ from web3.middleware import ExtraDataToPOAMiddleware
 from dex.util import sqrt_ratio_x96_to_price
 load_dotenv()
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.WARNING)
 
 class UniswapV4Dex:
     """
