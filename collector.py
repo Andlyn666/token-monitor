@@ -11,7 +11,9 @@ import signal
 from datetime import datetime
 from decimal import Decimal
 from typing import Dict, Optional, Set
+
 from cex.cex_base import format_price, SpotData, FuturesData, CexPriceData
+from exchange_rates import RateFetcher
 
 # CEX_MAP and DEX_MAP are now stored in database (exchanges table)
 from db.database import Database
@@ -69,6 +71,10 @@ class PriceCollector:
         # Track active task IDs for change detection
         self.active_cex_tasks: Set[int] = set()
         self.active_dex_tasks: Set[int] = set()
+        
+        # Exchange rate fetcher
+        self.rate_fetcher: Optional[RateFetcher] = None
+        self.rate_update_interval = 3600  # 1 hour in seconds
 
     async def start(self):
         """Start the collector"""
@@ -80,16 +86,22 @@ class PriceCollector:
         # Initialize tables if not exists
         await self.db.init_tables()
         
+        # Initialize exchange rate fetcher
+        proxy = os.getenv('HTTPS_PROXY') or os.getenv('HTTP_PROXY')
+        self.rate_fetcher = RateFetcher(proxy=proxy)
+        await self.rate_fetcher.init()
+        
         self.running = True
         
         # Start main collection loops
         cex_task = asyncio.create_task(self._cex_collection_loop())
         dex_task = asyncio.create_task(self._dex_collection_loop())
+        rate_task = asyncio.create_task(self._exchange_rate_collection_loop())
         
         logger.info("Price collector started, loading tasks from database...")
         
-        # Wait for both loops
-        await asyncio.gather(cex_task, dex_task, return_exceptions=True)
+        # Wait for all loops
+        await asyncio.gather(cex_task, dex_task, rate_task, return_exceptions=True)
 
     async def stop(self):
         """Stop the collector gracefully"""
@@ -102,6 +114,13 @@ class PriceCollector:
                 await collector.close()
             except Exception as e:
                 logger.error(f"Error closing collector: {e}")
+        
+        # Close exchange rate fetcher
+        if self.rate_fetcher:
+            try:
+                await self.rate_fetcher.close()
+            except Exception as e:
+                logger.error(f"Error closing rate fetcher: {e}")
         
         # Close database
         await self.db.close()
@@ -148,21 +167,33 @@ class PriceCollector:
             logger.info(f"[{task['exchange_name']}] Using stored precision for {task['base_token']}: {precision}")
             return precision
         
-        # Fetch precision from exchange (use futures symbol)
-        symbol = task.get('fut_symbol') or task.get('spot_symbol')
-        if not symbol:
-            return None
-        try:
-            precision = await collector.get_price_precision(symbol)
-            if precision is not None:
-                # Save to database
-                await self.db.update_task_precision(task['id'], precision)
-                task['price_precision'] = precision
-                logger.info(f"[{task['exchange_name']}] Loaded price precision for {symbol}: {precision}")
-            return precision
-        except Exception as e:
-            logger.error(f"[{task['exchange_name']}] Failed to get precision for {symbol}: {e}")
-            return None
+        # Fetch precision from exchange (prefer futures, fallback to spot)
+        fut_symbol = task.get('fut_symbol')
+        spot_symbol = task.get('spot_symbol')
+        
+        precision = None
+        # Try futures first if available
+        if fut_symbol:
+            try:
+                precision = await collector.get_price_precision(fut_symbol, use_spot=False)
+            except Exception as e:
+                logger.debug(f"[{task['exchange_name']}] Failed to get futures precision: {e}")
+        
+        # Fallback to spot if futures not available or failed
+        if precision is None and spot_symbol:
+            try:
+                precision = await collector.get_price_precision(spot_symbol, use_spot=True)
+            except Exception as e:
+                logger.debug(f"[{task['exchange_name']}] Failed to get spot precision: {e}")
+        
+        if precision is not None:
+            # Save to database
+            await self.db.update_task_precision(task['id'], precision)
+            task['price_precision'] = precision
+            symbol = fut_symbol or spot_symbol
+            logger.info(f"[{task['exchange_name']}] Loaded price precision for {symbol}: {precision}")
+        
+        return precision
 
     def _format_cex_prices(self, data, precision: int):
         """
@@ -323,6 +354,52 @@ class PriceCollector:
                 logger.error(f"DEX collection loop error: {e}")
                 await asyncio.sleep(5)
 
+    async def _exchange_rate_collection_loop(self):
+        """Exchange rate collection loop - updates every hour"""
+        while self.running:
+            try:
+                await self._update_exchange_rates()
+                
+                # Sleep for 1 hour
+                await asyncio.sleep(self.rate_update_interval)
+                
+            except Exception as e:
+                logger.error(f"Exchange rate collection error: {e}")
+                await asyncio.sleep(60)  # Retry after 1 minute on error
+
+    async def _update_exchange_rates(self):
+        """Fetch and update all exchange rates from database"""
+        # Get currencies to update from database
+        currencies = await self.db.get_currencies_to_update()
+        
+        if not currencies:
+            logger.debug("No currencies to update")
+            return
+        
+        timestamp = datetime.utcnow()
+        updated_count = 0
+        
+        for currency in currencies:
+            try:
+                rate = await self._fetch_exchange_rate(currency)
+                if rate is not None:
+                    await self.db.upsert_exchange_rate(
+                        currency=currency,
+                        rate_to_usdt=rate,
+                        timestamp=timestamp,
+                    )
+                    updated_count += 1
+                    logger.debug(f"Updated rate: 1 {currency.upper()} = {rate} USDT")
+            except Exception as e:
+                logger.warning(f"Failed to update rate for {currency}: {e}")
+        
+        if updated_count > 0:
+            logger.info(f"Updated {updated_count} exchange rates")
+
+    async def _fetch_exchange_rate(self, currency: str) -> Optional[Decimal]:
+        """Fetch exchange rate for a currency to USDT using RateFetcher"""
+        return await self.rate_fetcher.fetch_rate(currency)
+
     async def _collect_cex_data(self, task: dict):
         """Collect data for a single CEX task"""
         task_id = task['id']
@@ -465,22 +542,39 @@ async def main():
     collector = PriceCollector()
     
     # Handle graceful shutdown
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
+    shutdown_event = asyncio.Event()
     
     def signal_handler():
-        logger.info("Received shutdown signal")
+        logger.info("Received shutdown signal, stopping...")
         collector.running = False
+        shutdown_event.set()
     
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, signal_handler)
     
     try:
-        await collector.start()
+        # Start collector in background
+        collector_task = asyncio.create_task(collector.start())
+        
+        # Wait for shutdown signal
+        await shutdown_event.wait()
+        
+        # Cancel the collector task
+        collector_task.cancel()
+        try:
+            await collector_task
+        except asyncio.CancelledError:
+            pass
+            
     except KeyboardInterrupt:
-        pass
+        collector.running = False
     finally:
         await collector.stop()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nShutdown complete.")

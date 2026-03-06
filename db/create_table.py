@@ -65,9 +65,17 @@ CREATE TABLE IF NOT EXISTS config_monitoring_tasks (
     FOREIGN KEY (exchange_id) REFERENCES exchanges(id),
     FOREIGN KEY (base_token_id) REFERENCES tokens(id),
     FOREIGN KEY (spot_quote_token_id) REFERENCES tokens(id),
-    FOREIGN KEY (fut_quote_token_id) REFERENCES tokens(id),
-    -- 唯一约束：同一交易所的同一基础币只能有一条记录
-    UNIQUE (exchange_id, base_token_id)
+    FOREIGN KEY (fut_quote_token_id) REFERENCES tokens(id)
+);
+
+-- 唯一约束：同一交易所+基础币+报价币组合只能有一条记录
+-- 使用 COALESCE 处理 NULL 值 (NULL 变为 -1)
+CREATE UNIQUE INDEX IF NOT EXISTS idx_config_tasks_unique_pair 
+ON config_monitoring_tasks (
+    exchange_id, 
+    base_token_id, 
+    COALESCE(spot_quote_token_id, -1), 
+    COALESCE(fut_quote_token_id, -1)
 );
 
 -- 为配置表创建索引
@@ -82,12 +90,12 @@ CREATE TABLE mm_cex_latest (
     exchange_id SMALLINT NOT NULL,         -- 交易所 ID (引用 exchanges 表)
     base_token VARCHAR(32) NOT NULL,       -- 基础币标识 (e.g., rave)
     -- 现货数据
-    spot_symbol VARCHAR(32),               -- 现货交易对 (e.g., rave_usd1)
+    spot_symbol VARCHAR(32) NOT NULL DEFAULT '',  -- 现货交易对 (e.g., rave_usd1)
     spot_price NUMERIC,                    -- 现货最新成交价
     best_bid NUMERIC,                      -- 现货买一价
     best_ask NUMERIC,                      -- 现货卖一价
     -- 合约数据
-    fut_symbol VARCHAR(32),                -- 合约交易对 (e.g., rave_usdt)
+    fut_symbol VARCHAR(32) NOT NULL DEFAULT '',   -- 合约交易对 (e.g., rave_usdt)
     fut_price NUMERIC,                     -- 合约最新成交价
     fut_index NUMERIC,                     -- 合约指数价格
     fut_mark NUMERIC,                      -- 合约标记价格
@@ -96,8 +104,8 @@ CREATE TABLE mm_cex_latest (
     timestamp TIMESTAMPTZ NOT NULL,        -- 数据采集/产生时间
     -- 外键约束
     FOREIGN KEY (exchange_id) REFERENCES exchanges(id),
-    -- 复合主键：保证 (exchange_id, base_token) 的唯一性
-    PRIMARY KEY (exchange_id, base_token)
+    -- 复合主键：支持同一交易所的多个币对
+    PRIMARY KEY (exchange_id, base_token, spot_symbol, fut_symbol)
 );
 """
 
@@ -107,12 +115,12 @@ CREATE TABLE mm_cex_historical (
     exchange_id SMALLINT NOT NULL,         -- 交易所 ID (引用 exchanges 表)
     base_token VARCHAR(32) NOT NULL,       -- 基础币标识 (e.g., rave)
     -- 现货数据
-    spot_symbol VARCHAR(32),               -- 现货交易对 (e.g., rave_usd1)
+    spot_symbol VARCHAR(32) NOT NULL DEFAULT '',  -- 现货交易对 (e.g., rave_usd1)
     spot_price NUMERIC,                    -- 现货最新成交价
     best_bid NUMERIC,                      -- 现货买一价
     best_ask NUMERIC,                      -- 现货卖一价
     -- 合约数据
-    fut_symbol VARCHAR(32),                -- 合约交易对 (e.g., rave_usdt)
+    fut_symbol VARCHAR(32) NOT NULL DEFAULT '',   -- 合约交易对 (e.g., rave_usdt)
     fut_price NUMERIC,                     -- 合约最新成交价
     fut_index NUMERIC,                     -- 合约指数价格
     fut_mark NUMERIC,                      -- 合约标记价格
@@ -120,7 +128,7 @@ CREATE TABLE mm_cex_historical (
     funding_interval VARCHAR(16),          -- 资金费结算周期
     timestamp TIMESTAMPTZ NOT NULL,        -- 数据产生时间
     -- 在分区表中，主键必须包含分区键 (timestamp)
-    PRIMARY KEY (exchange_id, base_token, timestamp)
+    PRIMARY KEY (exchange_id, base_token, spot_symbol, fut_symbol, timestamp)
 ) PARTITION BY RANGE (timestamp);
 """
 
@@ -233,6 +241,59 @@ CREATE TABLE IF NOT EXISTS mm_dex_historical_2026_12 PARTITION OF mm_dex_histori
     FOR VALUES FROM ('2026-12-01') TO ('2027-01-01');
 """
 
+# 汇率最新表
+CREATE_EXCHANGE_RATES_LATEST = """
+CREATE TABLE IF NOT EXISTS exchange_rates_latest (
+    currency VARCHAR(16) PRIMARY KEY,      -- 货币代码 (e.g., 'eur', 'btc')
+    rate_to_usdt NUMERIC NOT NULL,         -- 对 USDT 的汇率
+    updated_at TIMESTAMPTZ NOT NULL        -- 更新时间
+);
+
+-- 初始化 EUR
+INSERT INTO exchange_rates_latest (currency, rate_to_usdt, updated_at) VALUES
+    ('eur', 1.0, NOW())
+ON CONFLICT (currency) DO NOTHING;
+"""
+
+# 汇率历史表 (按月分区)
+CREATE_EXCHANGE_RATES_HISTORICAL = """
+CREATE TABLE IF NOT EXISTS exchange_rates_historical (
+    currency VARCHAR(16) NOT NULL,         -- 货币代码
+    rate_to_usdt NUMERIC NOT NULL,         -- 对 USDT 的汇率
+    recorded_at TIMESTAMPTZ NOT NULL,      -- 记录时间
+    PRIMARY KEY (currency, recorded_at)
+) PARTITION BY RANGE (recorded_at);
+"""
+
+# 汇率历史表分区
+CREATE_EXCHANGE_RATES_PARTITIONS = """
+-- 2026 年分区
+CREATE TABLE IF NOT EXISTS exchange_rates_historical_2026_01 PARTITION OF exchange_rates_historical
+    FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');
+CREATE TABLE IF NOT EXISTS exchange_rates_historical_2026_02 PARTITION OF exchange_rates_historical
+    FOR VALUES FROM ('2026-02-01') TO ('2026-03-01');
+CREATE TABLE IF NOT EXISTS exchange_rates_historical_2026_03 PARTITION OF exchange_rates_historical
+    FOR VALUES FROM ('2026-03-01') TO ('2026-04-01');
+CREATE TABLE IF NOT EXISTS exchange_rates_historical_2026_04 PARTITION OF exchange_rates_historical
+    FOR VALUES FROM ('2026-04-01') TO ('2026-05-01');
+CREATE TABLE IF NOT EXISTS exchange_rates_historical_2026_05 PARTITION OF exchange_rates_historical
+    FOR VALUES FROM ('2026-05-01') TO ('2026-06-01');
+CREATE TABLE IF NOT EXISTS exchange_rates_historical_2026_06 PARTITION OF exchange_rates_historical
+    FOR VALUES FROM ('2026-06-01') TO ('2026-07-01');
+CREATE TABLE IF NOT EXISTS exchange_rates_historical_2026_07 PARTITION OF exchange_rates_historical
+    FOR VALUES FROM ('2026-07-01') TO ('2026-08-01');
+CREATE TABLE IF NOT EXISTS exchange_rates_historical_2026_08 PARTITION OF exchange_rates_historical
+    FOR VALUES FROM ('2026-08-01') TO ('2026-09-01');
+CREATE TABLE IF NOT EXISTS exchange_rates_historical_2026_09 PARTITION OF exchange_rates_historical
+    FOR VALUES FROM ('2026-09-01') TO ('2026-10-01');
+CREATE TABLE IF NOT EXISTS exchange_rates_historical_2026_10 PARTITION OF exchange_rates_historical
+    FOR VALUES FROM ('2026-10-01') TO ('2026-11-01');
+CREATE TABLE IF NOT EXISTS exchange_rates_historical_2026_11 PARTITION OF exchange_rates_historical
+    FOR VALUES FROM ('2026-11-01') TO ('2026-12-01');
+CREATE TABLE IF NOT EXISTS exchange_rates_historical_2026_12 PARTITION OF exchange_rates_historical
+    FOR VALUES FROM ('2026-12-01') TO ('2027-01-01');
+"""
+
 # 迁移语句：为现有表添加字段
 ALTER_ADD_PRICE_PRECISION = """
 ALTER TABLE config_monitoring_tasks 
@@ -272,4 +333,110 @@ ALTER COLUMN pool_address TYPE VARCHAR(66);
 -- 修改 mm_dex_historical 表的 pool_address 字段
 ALTER TABLE mm_dex_historical 
 ALTER COLUMN pool_address TYPE VARCHAR(66);
+"""
+
+# 迁移语句：修改唯一约束以支持同一交易所的多个币对
+ALTER_UNIQUE_CONSTRAINT = """
+-- 删除旧的唯一约束 (如果存在)
+ALTER TABLE config_monitoring_tasks 
+DROP CONSTRAINT IF EXISTS config_monitoring_tasks_exchange_id_base_token_id_key;
+
+-- 创建新的唯一索引 (支持同一交易所的多个币对)
+DROP INDEX IF EXISTS idx_config_tasks_unique_pair;
+CREATE UNIQUE INDEX idx_config_tasks_unique_pair 
+ON config_monitoring_tasks (
+    exchange_id, 
+    base_token_id, 
+    COALESCE(spot_quote_token_id, -1), 
+    COALESCE(fut_quote_token_id, -1)
+);
+"""
+
+# 迁移语句：修改 CEX 表主键以支持同一 base_token 的多个币对
+ALTER_CEX_PRIMARY_KEY = """
+-- Step 1: 更新现有 NULL 值为空字符串
+UPDATE mm_cex_latest SET spot_symbol = '' WHERE spot_symbol IS NULL;
+UPDATE mm_cex_latest SET fut_symbol = '' WHERE fut_symbol IS NULL;
+UPDATE mm_cex_historical SET spot_symbol = '' WHERE spot_symbol IS NULL;
+UPDATE mm_cex_historical SET fut_symbol = '' WHERE fut_symbol IS NULL;
+
+-- Step 2: 修改 mm_cex_latest 表
+ALTER TABLE mm_cex_latest 
+ALTER COLUMN spot_symbol SET NOT NULL,
+ALTER COLUMN spot_symbol SET DEFAULT '',
+ALTER COLUMN fut_symbol SET NOT NULL,
+ALTER COLUMN fut_symbol SET DEFAULT '';
+
+ALTER TABLE mm_cex_latest DROP CONSTRAINT mm_cex_latest_pkey;
+ALTER TABLE mm_cex_latest ADD PRIMARY KEY (exchange_id, base_token, spot_symbol, fut_symbol);
+
+-- Step 3: 修改 mm_cex_historical 表
+ALTER TABLE mm_cex_historical 
+ALTER COLUMN spot_symbol SET NOT NULL,
+ALTER COLUMN spot_symbol SET DEFAULT '',
+ALTER COLUMN fut_symbol SET NOT NULL,
+ALTER COLUMN fut_symbol SET DEFAULT '';
+
+ALTER TABLE mm_cex_historical DROP CONSTRAINT mm_cex_historical_pkey;
+ALTER TABLE mm_cex_historical ADD PRIMARY KEY (exchange_id, base_token, spot_symbol, fut_symbol, timestamp);
+"""
+
+# 清理旧分区的函数 (删除超过 N 个月的历史数据)
+CREATE_CLEANUP_FUNCTION = """
+CREATE OR REPLACE FUNCTION cleanup_old_partitions(months_to_keep INTEGER DEFAULT 3)
+RETURNS TEXT AS $$
+DECLARE
+    cutoff_date DATE;
+    partition_name TEXT;
+    dropped_count INTEGER := 0;
+    result TEXT := '';
+BEGIN
+    cutoff_date := DATE_TRUNC('month', CURRENT_DATE - (months_to_keep || ' months')::INTERVAL);
+    
+    -- 清理 mm_cex_historical 分区
+    FOR partition_name IN
+        SELECT tablename FROM pg_tables 
+        WHERE tablename LIKE 'mm_cex_historical_____\\___' 
+        AND schemaname = 'public'
+    LOOP
+        IF TO_DATE(SUBSTRING(partition_name FROM 'mm_cex_historical_(\\d{4}_\\d{2})'), 'YYYY_MM') < cutoff_date THEN
+            EXECUTE 'DROP TABLE IF EXISTS ' || partition_name;
+            dropped_count := dropped_count + 1;
+            result := result || 'Dropped: ' || partition_name || E'\\n';
+        END IF;
+    END LOOP;
+    
+    -- 清理 mm_dex_historical 分区
+    FOR partition_name IN
+        SELECT tablename FROM pg_tables 
+        WHERE tablename LIKE 'mm_dex_historical_____\\___' 
+        AND schemaname = 'public'
+    LOOP
+        IF TO_DATE(SUBSTRING(partition_name FROM 'mm_dex_historical_(\\d{4}_\\d{2})'), 'YYYY_MM') < cutoff_date THEN
+            EXECUTE 'DROP TABLE IF EXISTS ' || partition_name;
+            dropped_count := dropped_count + 1;
+            result := result || 'Dropped: ' || partition_name || E'\\n';
+        END IF;
+    END LOOP;
+    
+    -- 清理 exchange_rates_historical 分区
+    FOR partition_name IN
+        SELECT tablename FROM pg_tables 
+        WHERE tablename LIKE 'exchange_rates_historical_____\\___' 
+        AND schemaname = 'public'
+    LOOP
+        IF TO_DATE(SUBSTRING(partition_name FROM 'exchange_rates_historical_(\\d{4}_\\d{2})'), 'YYYY_MM') < cutoff_date THEN
+            EXECUTE 'DROP TABLE IF EXISTS ' || partition_name;
+            dropped_count := dropped_count + 1;
+            result := result || 'Dropped: ' || partition_name || E'\\n';
+        END IF;
+    END LOOP;
+    
+    IF dropped_count = 0 THEN
+        RETURN 'No partitions older than ' || cutoff_date || ' found.';
+    END IF;
+    
+    RETURN result || 'Total dropped: ' || dropped_count || ' partitions.';
+END;
+$$ LANGUAGE plpgsql;
 """

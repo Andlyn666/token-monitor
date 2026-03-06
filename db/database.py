@@ -50,6 +50,10 @@ class Database:
             CREATE_MM_DEX_HISTORICAL,
             CREATE_MM_DEX_HISTORICAL_INDEXES,
             CREATE_DEX_HISTORICAL_PARTITIONS,
+            CREATE_EXCHANGE_RATES_LATEST,
+            CREATE_EXCHANGE_RATES_HISTORICAL,
+            CREATE_EXCHANGE_RATES_PARTITIONS,
+            CREATE_CLEANUP_FUNCTION,
             ALTER_ADD_PRICE_PRECISION,
             ALTER_ADD_TOKEN_FIELDS,
         )
@@ -68,6 +72,10 @@ class Database:
                 CREATE_MM_DEX_HISTORICAL,
                 CREATE_MM_DEX_HISTORICAL_INDEXES,
                 CREATE_DEX_HISTORICAL_PARTITIONS,
+                CREATE_EXCHANGE_RATES_LATEST,
+                CREATE_EXCHANGE_RATES_HISTORICAL,
+                CREATE_EXCHANGE_RATES_PARTITIONS,
+                CREATE_CLEANUP_FUNCTION,
             ]:
                 try:
                     await conn.execute(sql)
@@ -107,12 +115,12 @@ class Database:
                     t.spot_quote_token_id,
                     sqt.name as spot_quote_token,
                     t.spot_remote_id,
-                    (bt.name || '_' || COALESCE(sqt.name, '')) as spot_symbol,
+                    CASE WHEN sqt.name IS NOT NULL THEN bt.name || '_' || sqt.name ELSE NULL END as spot_symbol,
                     -- 合约配置
                     t.fut_quote_token_id,
                     fqt.name as fut_quote_token,
                     t.fut_remote_id,
-                    (bt.name || '_' || COALESCE(fqt.name, '')) as fut_symbol,
+                    CASE WHEN fqt.name IS NOT NULL THEN bt.name || '_' || fqt.name ELSE NULL END as fut_symbol,
                     -- 通用配置
                     t.extra_params, 
                     t.update_interval, 
@@ -145,7 +153,7 @@ class Database:
                     bt.name as base_token,
                     t.spot_quote_token_id as quote_token_id,
                     sqt.name as quote_token,
-                    (bt.name || '_' || COALESCE(sqt.name, '')) as unified_symbol,
+                    CASE WHEN sqt.name IS NOT NULL THEN bt.name || '_' || sqt.name ELSE NULL END as unified_symbol,
                     t.spot_remote_id as remote_id,
                     t.extra_params, 
                     t.update_interval
@@ -188,34 +196,58 @@ class Database:
         is_active: bool = True,
     ) -> int:
         """
-        Add a new monitoring task
+        Add a new monitoring task or update existing one
+        Unique key: (exchange_id, base_token_id, spot_quote_token_id, fut_quote_token_id)
         Returns: task id
         """
         import json
         async with self.pool.acquire() as conn:
-            row = await conn.fetchrow(
+            # Check if task with same unique key exists
+            existing = await conn.fetchrow(
                 """
-                INSERT INTO config_monitoring_tasks 
-                    (exchange_id, base_token_id, spot_quote_token_id, spot_remote_id,
-                     fut_quote_token_id, fut_remote_id, platform_type,
-                     extra_params, update_interval, is_active)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-                ON CONFLICT (exchange_id, base_token_id) DO UPDATE SET
-                    spot_quote_token_id = EXCLUDED.spot_quote_token_id,
-                    spot_remote_id = EXCLUDED.spot_remote_id,
-                    fut_quote_token_id = EXCLUDED.fut_quote_token_id,
-                    fut_remote_id = EXCLUDED.fut_remote_id,
-                    extra_params = EXCLUDED.extra_params,
-                    update_interval = EXCLUDED.update_interval,
-                    is_active = EXCLUDED.is_active,
-                    updated_at = NOW()
-                RETURNING id
+                SELECT id FROM config_monitoring_tasks 
+                WHERE exchange_id = $1 
+                  AND base_token_id = $2 
+                  AND COALESCE(spot_quote_token_id, -1) = COALESCE($3, -1)
+                  AND COALESCE(fut_quote_token_id, -1) = COALESCE($4, -1)
                 """,
-                exchange_id, base_token_id, spot_quote_token_id, spot_remote_id,
-                fut_quote_token_id, fut_remote_id, platform_type,
-                json.dumps(extra_params or {}), update_interval, is_active
+                exchange_id, base_token_id, spot_quote_token_id, fut_quote_token_id
             )
-            return row['id']
+            
+            if existing:
+                # Update existing task
+                await conn.execute(
+                    """
+                    UPDATE config_monitoring_tasks SET
+                        spot_remote_id = $1,
+                        fut_remote_id = $2,
+                        extra_params = $3,
+                        update_interval = $4,
+                        is_active = $5,
+                        updated_at = NOW()
+                    WHERE id = $6
+                    """,
+                    spot_remote_id, fut_remote_id,
+                    json.dumps(extra_params or {}), update_interval, is_active,
+                    existing['id']
+                )
+                return existing['id']
+            else:
+                # Insert new task
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO config_monitoring_tasks 
+                        (exchange_id, base_token_id, spot_quote_token_id, spot_remote_id,
+                         fut_quote_token_id, fut_remote_id, platform_type,
+                         extra_params, update_interval, is_active)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                    RETURNING id
+                    """,
+                    exchange_id, base_token_id, spot_quote_token_id, spot_remote_id,
+                    fut_quote_token_id, fut_remote_id, platform_type,
+                    json.dumps(extra_params or {}), update_interval, is_active
+                )
+                return row['id']
 
     async def update_task_status(self, task_id: int, is_active: bool):
         """Enable or disable a task"""
@@ -275,7 +307,7 @@ class Database:
                     t.fut_quote_token_id,
                     fqt.name as fut_quote_token,
                     t.fut_remote_id,
-                    (bt.name || '_' || COALESCE(fqt.name, '')) as fut_symbol,
+                    CASE WHEN fqt.name IS NOT NULL THEN bt.name || '_' || fqt.name ELSE NULL END as fut_symbol,
                     t.extra_params, 
                     t.update_interval
                 FROM config_monitoring_tasks t
@@ -363,6 +395,10 @@ class Database:
         if timestamp is None:
             timestamp = datetime.utcnow()
         
+        # Convert None to empty string for primary key columns
+        spot_symbol = spot_symbol or ''
+        fut_symbol = fut_symbol or ''
+        
         async with self.pool.acquire() as conn:
             # Upsert to latest table
             await conn.execute(
@@ -371,12 +407,10 @@ class Database:
                     exchange_id, base_token, spot_symbol, spot_price, best_bid, best_ask,
                     fut_symbol, fut_price, fut_index, fut_mark, funding_rate, funding_interval, timestamp
                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-                ON CONFLICT (exchange_id, base_token) DO UPDATE SET
-                    spot_symbol = EXCLUDED.spot_symbol,
+                ON CONFLICT (exchange_id, base_token, spot_symbol, fut_symbol) DO UPDATE SET
                     spot_price = EXCLUDED.spot_price,
                     best_bid = EXCLUDED.best_bid,
                     best_ask = EXCLUDED.best_ask,
-                    fut_symbol = EXCLUDED.fut_symbol,
                     fut_price = EXCLUDED.fut_price,
                     fut_index = EXCLUDED.fut_index,
                     fut_mark = EXCLUDED.fut_mark,
@@ -542,3 +576,103 @@ class Database:
         """Batch upsert multiple DEX price data"""
         for data in data_list:
             await self.upsert_dex_latest(**data)
+
+    # =========================================================================
+    # Exchange Rate Operations
+    # =========================================================================
+
+    async def upsert_exchange_rate(
+        self,
+        currency: str,
+        rate_to_usdt: Decimal,
+        timestamp: Optional[datetime] = None,
+    ):
+        """
+        Upsert exchange rate (currency to USDT)
+        Also inserts into historical table
+        """
+        if timestamp is None:
+            timestamp = datetime.utcnow()
+        
+        currency = currency.lower()
+        
+        async with self.pool.acquire() as conn:
+            # Upsert to latest table
+            await conn.execute(
+                """
+                INSERT INTO exchange_rates_latest (currency, rate_to_usdt, updated_at)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (currency) DO UPDATE SET
+                    rate_to_usdt = EXCLUDED.rate_to_usdt,
+                    updated_at = EXCLUDED.updated_at
+                """,
+                currency, rate_to_usdt, timestamp
+            )
+            
+            # Insert to historical table
+            await conn.execute(
+                """
+                INSERT INTO exchange_rates_historical (currency, rate_to_usdt, recorded_at)
+                VALUES ($1, $2, $3)
+                """,
+                currency, rate_to_usdt, timestamp
+            )
+        
+        logger.debug(f"Upserted exchange rate: {currency} = {rate_to_usdt} USDT")
+
+    async def get_exchange_rate(self, currency: str) -> Optional[Decimal]:
+        """Get current exchange rate for a currency"""
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT rate_to_usdt FROM exchange_rates_latest
+                WHERE currency = $1
+                """,
+                currency.lower()
+            )
+            return Decimal(str(row['rate_to_usdt'])) if row else None
+
+    async def get_all_exchange_rates(self) -> List[dict]:
+        """Get all current exchange rates"""
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT currency, rate_to_usdt, updated_at
+                FROM exchange_rates_latest
+                ORDER BY currency
+                """
+            )
+            return [dict(row) for row in rows]
+
+    async def get_currencies_to_update(self) -> List[str]:
+        """Get list of currencies that need rate updates"""
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT currency FROM exchange_rates_latest"
+            )
+            return [row['currency'] for row in rows]
+
+    async def batch_upsert_exchange_rates(self, rates: List[dict]):
+        """Batch upsert multiple exchange rates"""
+        for rate in rates:
+            await self.upsert_exchange_rate(
+                currency=rate['currency'],
+                rate_to_usdt=rate['rate_to_usdt'],
+                timestamp=rate.get('timestamp'),
+            )
+
+    # =========================================================================
+    # Maintenance Operations
+    # =========================================================================
+
+    async def cleanup_old_partitions(self, months_to_keep: int = 3) -> str:
+        """
+        Delete historical partitions older than specified months
+        Returns a summary of dropped partitions
+        """
+        async with self.pool.acquire() as conn:
+            result = await conn.fetchval(
+                "SELECT cleanup_old_partitions($1)",
+                months_to_keep
+            )
+            return result

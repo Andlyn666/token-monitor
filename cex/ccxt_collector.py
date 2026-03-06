@@ -142,10 +142,14 @@ class CcxtCollector(CexBase):
             funding_interval=funding_interval,
         )
     
-    async def get_price_precision(self, symbol: str) -> Optional[int]:
+    async def get_price_precision(self, symbol: str, use_spot: bool = False) -> Optional[int]:
         """
         Get price precision (decimal places) for a symbol from exchange info
         Uses CCXT's cached markets data
+        
+        Args:
+            symbol: Trading pair symbol (e.g., 'rave_usdt')
+            use_spot: If True, use spot exchange; if False, use futures exchange
         
         Note: CCXT returns precision in different formats:
         - Some exchanges: decimal places (e.g., 6 means 6 decimal places)
@@ -163,12 +167,18 @@ class CcxtCollector(CexBase):
             return int(round(-math.log10(tick_size)))
         
         try:
-            # Load markets if not loaded
-            if not self.futures_exchange.markets:
-                await self.futures_exchange.load_markets()
-            
-            ccxt_symbol = unified_to_ccxt_swap_symbol(symbol)
-            market = self.futures_exchange.market(ccxt_symbol)
+            if use_spot:
+                # Use spot exchange
+                if not self.spot_exchange.markets:
+                    await self.spot_exchange.load_markets()
+                ccxt_symbol = unified_to_ccxt_symbol(symbol)
+                market = self.spot_exchange.market(ccxt_symbol)
+            else:
+                # Use futures exchange
+                if not self.futures_exchange.markets:
+                    await self.futures_exchange.load_markets()
+                ccxt_symbol = unified_to_ccxt_swap_symbol(symbol)
+                market = self.futures_exchange.market(ccxt_symbol)
             
             if market and 'precision' in market:
                 precision = market['precision']
