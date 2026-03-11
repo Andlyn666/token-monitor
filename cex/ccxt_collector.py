@@ -4,11 +4,39 @@ Supports: Binance, Bitget, Bybit, OKX, Gate, Kraken, Aster
 """
 import asyncio
 import httpx
+import logging
+import os
 from decimal import Decimal
 from typing import Dict, Optional
 import ccxt.async_support as ccxt
 
 from cex.cex_base import CexBase, SpotData, FuturesData, CexPriceData
+
+logger = logging.getLogger(__name__)
+
+
+def calculate_mid_price(bid: Optional[Decimal], ask: Optional[Decimal], last: Optional[Decimal]) -> Optional[Decimal]:
+    """
+    Calculate price using midpoint of bid/ask, fallback to last price
+    Returns: (bid + ask) / 2 if both valid, else last price
+    """
+    if bid and ask and bid > 0 and ask > 0:
+        return (bid + ask) / 2
+    return last
+
+
+async def fetch_best_bid_ask(exchange, symbol: str) -> tuple:
+    """
+    Fetch best bid/ask from order book (limit=1 for efficiency)
+    Returns: (best_bid, best_ask) as Decimal or (None, None) on error
+    """
+    try:
+        orderbook = await exchange.fetch_order_book(symbol, limit=1)
+        best_bid = Decimal(str(orderbook['bids'][0][0])) if orderbook.get('bids') and orderbook['bids'] else None
+        best_ask = Decimal(str(orderbook['asks'][0][0])) if orderbook.get('asks') and orderbook['asks'] else None
+        return best_bid, best_ask
+    except Exception:
+        return None, None
 
 
 # Symbol conversion: unified format (btc_usdt) -> exchange format (BTC/USDT)
@@ -75,6 +103,7 @@ class CcxtCollector(CexBase):
     async def get_spot_price(self, symbol: str, **kwargs) -> SpotData:
         """
         Fetch spot price data using CCXT
+        Price = (bid + ask) / 2 if both valid, else last price
         kwargs are ignored for CCXT-based exchanges (used by BinanceAlpha for alpha_id)
         """
         ccxt_symbol = unified_to_ccxt_symbol(symbol)
@@ -82,20 +111,37 @@ class CcxtCollector(CexBase):
         # Fetch ticker data
         ticker = await self.spot_exchange.fetch_ticker(ccxt_symbol)
         
+        # Debug: log raw ticker data
+        if os.getenv('DEBUG_TICKER'):
+            logger.warning(f"[{self.cex_name}] SPOT ticker for {symbol}: {ticker}")
+        
+        # Parse values
+        last_price = Decimal(str(ticker['last'])) if ticker.get('last') else None
+        best_bid = Decimal(str(ticker['bid'])) if ticker.get('bid') else None
+        best_ask = Decimal(str(ticker['ask'])) if ticker.get('ask') else None
+        
+        # Calculate mid price: (bid + ask) / 2, fallback to last
+        price = calculate_mid_price(best_bid, best_ask, last_price)
+        
         return SpotData(
-            price=Decimal(str(ticker['last'])) if ticker.get('last') else None,
-            best_bid=Decimal(str(ticker['bid'])) if ticker.get('bid') else None,
-            best_ask=Decimal(str(ticker['ask'])) if ticker.get('ask') else None,
+            price=price,
+            best_bid=best_bid,
+            best_ask=best_ask,
         )
 
     async def get_futures_price(self, symbol: str) -> FuturesData:
         """
         Fetch futures/perpetual price data using CCXT
+        Price = (bid + ask) / 2 if both valid, else last price
         """
         ccxt_symbol = unified_to_ccxt_swap_symbol(symbol)
         
         # Fetch ticker data for futures
         ticker = await self.futures_exchange.fetch_ticker(ccxt_symbol)
+        
+        # Debug: log raw ticker data
+        if os.getenv('DEBUG_TICKER'):
+            logger.warning(f"[{self.cex_name}] FUTURES ticker for {symbol}: {ticker}")
         
         # Fetch funding rate info
         funding_rate = None
@@ -103,11 +149,6 @@ class CcxtCollector(CexBase):
         try:
             funding_info = await self.futures_exchange.fetch_funding_rate(ccxt_symbol)
             funding_rate = Decimal(str(funding_info['fundingRate'])) if funding_info.get('fundingRate') else None
-            
-            # Try to get funding interval
-            if funding_info.get('fundingTimestamp') and funding_info.get('fundingDatetime'):
-                # Some exchanges provide interval info
-                pass
         except Exception:
             pass
 
@@ -134,8 +175,16 @@ class CcxtCollector(CexBase):
                 except:
                     pass
         
+        # Parse bid/ask/last
+        last_price = Decimal(str(ticker['last'])) if ticker.get('last') else None
+        best_bid = Decimal(str(ticker['bid'])) if ticker.get('bid') else None
+        best_ask = Decimal(str(ticker['ask'])) if ticker.get('ask') else None
+        
+        # Calculate mid price: (bid + ask) / 2, fallback to last
+        price = calculate_mid_price(best_bid, best_ask, last_price)
+        
         return FuturesData(
-            price=Decimal(str(ticker['last'])) if ticker.get('last') else None,
+            price=price,
             index_price=index_price,
             mark_price=mark_price,
             funding_rate=funding_rate,
@@ -220,15 +269,19 @@ class BinanceCollector(CcxtCollector):
     async def get_futures_price(self, symbol: str) -> FuturesData:
         """
         Fetch futures data for Binance with funding interval (parallel requests)
+        Price = (bid + ask) / 2 if both valid, else last price
         Optimized: premiumIndex returns fundingRate, so no need for separate fetch_funding_rate
         """
         ccxt_symbol = unified_to_ccxt_swap_symbol(symbol)
         parts = symbol.upper().split('_')
         binance_symbol = f"{parts[0]}{parts[1]}" if len(parts) == 2 else symbol.replace('/', '').replace(':', '')
         
-        # Define async tasks (3 requests instead of 4)
+        # Define async tasks (4 requests in parallel)
         async def fetch_ticker():
             return await self.futures_exchange.fetch_ticker(ccxt_symbol)
+        
+        async def fetch_orderbook():
+            return await fetch_best_bid_ask(self.futures_exchange, ccxt_symbol)
         
         async def fetch_premium_index():
             # Returns: markPrice, indexPrice, lastFundingRate, nextFundingTime
@@ -248,10 +301,16 @@ class BinanceCollector(CcxtCollector):
             except Exception:
                 return None
         
-        # Execute all requests in parallel (3 requests)
-        ticker, premium_data, funding_info_data = await asyncio.gather(
-            fetch_ticker(), fetch_premium_index(), fetch_funding_info()
+        # Execute all requests in parallel (4 requests)
+        ticker, (ob_bid, ob_ask), premium_data, funding_info_data = await asyncio.gather(
+            fetch_ticker(), fetch_orderbook(), fetch_premium_index(), fetch_funding_info()
         )
+        
+        # Debug: log raw ticker data
+        if os.getenv('DEBUG_TICKER'):
+            logger.warning(f"[binance] FUTURES ticker for {symbol}: {ticker}")
+            logger.warning(f"[binance] FUTURES orderbook bid/ask: {ob_bid}/{ob_ask}")
+            logger.warning(f"[binance] premiumIndex for {symbol}: {premium_data}")
         
         # Parse from premiumIndex: markPrice, indexPrice, fundingRate
         mark_price = None
@@ -273,8 +332,14 @@ class BinanceCollector(CcxtCollector):
                     funding_interval = f"{item['fundingIntervalHours']}h"
                     break
         
+        # Parse bid/ask from ticker first, fallback to order book
+        last_price = Decimal(str(ticker['last'])) if ticker.get('last') else None
+        best_bid = Decimal(str(ticker['bid'])) if ticker.get('bid') else ob_bid
+        best_ask = Decimal(str(ticker['ask'])) if ticker.get('ask') else ob_ask
+        price = calculate_mid_price(best_bid, best_ask, last_price)
+        
         return FuturesData(
-            price=Decimal(str(ticker['last'])) if ticker.get('last') else None,
+            price=price,
             index_price=index_price,
             mark_price=mark_price,
             funding_rate=funding_rate,
@@ -303,6 +368,7 @@ class BitgetCollector(CcxtCollector):
     async def get_futures_price(self, symbol: str) -> FuturesData:
         """
         Fetch futures data for Bitget with funding interval (parallel requests)
+        Price = (bid + ask) / 2 if both valid, else last price
         """
         ccxt_symbol = unified_to_ccxt_swap_symbol(symbol)
         parts = symbol.upper().split('_')
@@ -334,6 +400,10 @@ class BitgetCollector(CcxtCollector):
             fetch_ticker(), fetch_funding(), fetch_contract_info()
         )
         
+        # Debug: log raw ticker data
+        if os.getenv('DEBUG_TICKER'):
+            logger.warning(f"[bitget] FUTURES ticker for {symbol}: {ticker}")
+        
         # Parse funding rate
         funding_rate = None
         if funding_info and funding_info.get('fundingRate'):
@@ -357,8 +427,14 @@ class BitgetCollector(CcxtCollector):
             if info.get('indexPrice'):
                 index_price = Decimal(str(info['indexPrice']))
         
+        # Parse bid/ask/last and calculate mid price
+        last_price = Decimal(str(ticker['last'])) if ticker.get('last') else None
+        best_bid = Decimal(str(ticker['bid'])) if ticker.get('bid') else None
+        best_ask = Decimal(str(ticker['ask'])) if ticker.get('ask') else None
+        price = calculate_mid_price(best_bid, best_ask, last_price)
+        
         return FuturesData(
-            price=Decimal(str(ticker['last'])) if ticker.get('last') else None,
+            price=price,
             index_price=index_price,
             mark_price=mark_price,
             funding_rate=funding_rate,
@@ -380,11 +456,16 @@ class BybitCollector(CcxtCollector):
     async def get_futures_price(self, symbol: str) -> FuturesData:
         """
         Fetch futures data for Bybit with funding interval
+        Price = (bid + ask) / 2 if both valid, else last price
         """
         ccxt_symbol = unified_to_ccxt_swap_symbol(symbol)
         
         # Fetch ticker data
         ticker = await self.futures_exchange.fetch_ticker(ccxt_symbol)
+        
+        # Debug: log raw ticker data
+        if os.getenv('DEBUG_TICKER'):
+            logger.warning(f"[bybit] FUTURES ticker for {symbol}: {ticker}")
         
         # Fetch funding rate and interval
         funding_rate = None
@@ -419,8 +500,14 @@ class BybitCollector(CcxtCollector):
             if info.get('indexPrice'):
                 index_price = Decimal(str(info['indexPrice']))
         
+        # Parse bid/ask/last and calculate mid price
+        last_price = Decimal(str(ticker['last'])) if ticker.get('last') else None
+        best_bid = Decimal(str(ticker['bid'])) if ticker.get('bid') else None
+        best_ask = Decimal(str(ticker['ask'])) if ticker.get('ask') else None
+        price = calculate_mid_price(best_bid, best_ask, last_price)
+        
         return FuturesData(
-            price=Decimal(str(ticker['last'])) if ticker.get('last') else None,
+            price=price,
             index_price=index_price,
             mark_price=mark_price,
             funding_rate=funding_rate,
@@ -442,6 +529,7 @@ class OkxCollector(CcxtCollector):
     async def get_futures_price(self, symbol: str) -> FuturesData:
         """
         Fetch futures data for OKX with mark price from dedicated API (parallel requests)
+        Price = (bid + ask) / 2 if both valid, else last price
         Optimized: funding-rate API returns fundingRate, so no need for separate fetch_funding_rate
         """
         ccxt_symbol = unified_to_ccxt_swap_symbol(symbol)
@@ -451,7 +539,7 @@ class OkxCollector(CcxtCollector):
         okx_swap_id = f"{base}-{quote}-SWAP"
         okx_index_id = f"{base}-{quote}"
         
-        # Define async tasks (4 requests instead of 5)
+        # Define async tasks (4 requests in parallel)
         async def fetch_ticker():
             return await self.futures_exchange.fetch_ticker(ccxt_symbol)
         
@@ -485,6 +573,10 @@ class OkxCollector(CcxtCollector):
             fetch_ticker(), fetch_mark_price(), fetch_index_price(), fetch_funding_rate_api()
         )
         
+        # Debug: log raw ticker data
+        if os.getenv('DEBUG_TICKER'):
+            logger.warning(f"[okx] FUTURES ticker for {symbol}: {ticker}")
+        
         # Parse mark price
         mark_price = None
         if mark_data and mark_data.get('code') == '0' and mark_data.get('data'):
@@ -510,8 +602,14 @@ class OkxCollector(CcxtCollector):
                 interval_hours = (next_ts - current_ts) // (1000 * 60 * 60)
                 funding_interval = f"{interval_hours}h"
         
+        # Parse bid/ask/last and calculate mid price
+        last_price = Decimal(str(ticker['last'])) if ticker.get('last') else None
+        best_bid = Decimal(str(ticker['bid'])) if ticker.get('bid') else None
+        best_ask = Decimal(str(ticker['ask'])) if ticker.get('ask') else None
+        price = calculate_mid_price(best_bid, best_ask, last_price)
+        
         return FuturesData(
-            price=Decimal(str(ticker['last'])) if ticker.get('last') else None,
+            price=price,
             index_price=index_price,
             mark_price=mark_price,
             funding_rate=funding_rate,
@@ -533,11 +631,16 @@ class GateCollector(CcxtCollector):
     async def get_futures_price(self, symbol: str) -> FuturesData:
         """
         Fetch futures data for Gate with funding interval
+        Price = (bid + ask) / 2 if both valid, else last price
         """
         ccxt_symbol = unified_to_ccxt_swap_symbol(symbol)
         
         # Fetch ticker data
         ticker = await self.futures_exchange.fetch_ticker(ccxt_symbol)
+        
+        # Debug: log raw ticker data
+        if os.getenv('DEBUG_TICKER'):
+            logger.warning(f"[gate] FUTURES ticker for {symbol}: {ticker}")
         
         # Fetch funding rate and interval
         funding_rate = None
@@ -572,8 +675,14 @@ class GateCollector(CcxtCollector):
             if info.get('index_price'):
                 index_price = Decimal(str(info['index_price']))
         
+        # Parse bid/ask/last and calculate mid price
+        last_price = Decimal(str(ticker['last'])) if ticker.get('last') else None
+        best_bid = Decimal(str(ticker['bid'])) if ticker.get('bid') else None
+        best_ask = Decimal(str(ticker['ask'])) if ticker.get('ask') else None
+        price = calculate_mid_price(best_bid, best_ask, last_price)
+        
         return FuturesData(
-            price=Decimal(str(ticker['last'])) if ticker.get('last') else None,
+            price=price,
             index_price=index_price,
             mark_price=mark_price,
             funding_rate=funding_rate,
@@ -598,7 +707,7 @@ class KrakenCollector(CcxtCollector):
     async def get_futures_price(self, symbol: str) -> FuturesData:
         """
         Fetch futures data for Kraken Futures.
-        Krakenfutures returns markPrice instead of last price.
+        Price = (bid + ask) / 2 if both valid, else markPrice (Kraken has no last price)
         Funding interval is 1 hour for all Kraken perpetuals.
         """
         ccxt_symbol = unified_to_ccxt_swap_symbol(symbol)
@@ -607,21 +716,20 @@ class KrakenCollector(CcxtCollector):
         ticker = await self.futures_exchange.fetch_ticker(ccxt_symbol)
         info = ticker.get('info', {})
         
+        # Debug: log raw ticker data
+        if os.getenv('DEBUG_TICKER'):
+            logger.warning(f"[kraken] FUTURES ticker for {symbol}: {ticker}")
         
-        # Kraken Futures uses markPrice as the price (no last/close available)
-        price = None
+        # Get markPrice and indexPrice
         mark_price = None
         index_price = None
         
-        # Get markPrice (also used as the main price)
         if info.get('markPrice'):
             try:
                 mark_price = Decimal(str(info['markPrice']))
-                price = mark_price  # Use markPrice as fut_price
             except:
                 pass
         
-        # Get indexPrice
         if info.get('indexPrice'):
             try:
                 index_price = Decimal(str(info['indexPrice']))
@@ -635,6 +743,11 @@ class KrakenCollector(CcxtCollector):
                 funding_rate = Decimal(str(info['fundingRate']))
             except:
                 pass
+        
+        # Parse bid/ask/last and calculate mid price (fallback to markPrice if no last)
+        best_bid = Decimal(str(ticker['bid'])) if ticker.get('bid') else None
+        best_ask = Decimal(str(ticker['ask'])) if ticker.get('ask') else None
+        price = calculate_mid_price(best_bid, best_ask, mark_price)
         
         return FuturesData(
             price=price,
@@ -663,13 +776,17 @@ class AsterCollector(CcxtCollector):
     async def get_spot_price(self, symbol: str, **kwargs) -> SpotData:
         """
         Fetch spot price for Aster
+        Price = (bid + ask) / 2 if both valid, else last price
         Custom implementation to properly handle bid/ask when API returns 0
-        (CCXT converts 0 to None, but we want to preserve the actual value)
         """
         ccxt_symbol = unified_to_ccxt_symbol(symbol)
         
         # Fetch ticker data
         ticker = await self.spot_exchange.fetch_ticker(ccxt_symbol)
+        
+        # Debug: log raw ticker data
+        if os.getenv('DEBUG_TICKER'):
+            logger.warning(f"[aster] SPOT ticker for {symbol}: {ticker}")
         
         # Get raw info for bid/ask (CCXT may convert 0 to None)
         info = ticker.get('info', {})
@@ -681,7 +798,6 @@ class AsterCollector(CcxtCollector):
         if info.get('bidPrice') is not None:
             try:
                 bid_val = Decimal(str(info['bidPrice']))
-                # Only set to None if truly missing, keep 0 if API returns 0
                 best_bid = bid_val if bid_val > 0 else Decimal('0')
             except:
                 pass
@@ -693,8 +809,12 @@ class AsterCollector(CcxtCollector):
             except:
                 pass
         
+        # Calculate mid price
+        last_price = Decimal(str(ticker['last'])) if ticker.get('last') else None
+        price = calculate_mid_price(best_bid, best_ask, last_price)
+        
         return SpotData(
-            price=Decimal(str(ticker['last'])) if ticker.get('last') else None,
+            price=price,
             best_bid=best_bid,
             best_ask=best_ask,
         )
@@ -702,53 +822,77 @@ class AsterCollector(CcxtCollector):
     async def get_futures_price(self, symbol: str) -> FuturesData:
         """
         Fetch futures/perpetual price data for Aster
+        Price = (bid + ask) / 2 if both valid, else last price
         Uses httpx to fetch mark/index prices from premiumIndex endpoint
         """
         ccxt_symbol = unified_to_ccxt_swap_symbol(symbol)
+        parts = symbol.upper().split('_')
+        aster_symbol = f"{parts[0]}{parts[1]}" if len(parts) == 2 else symbol.replace('/', '').replace(':', '')
         
-        # Fetch ticker data for futures
-        ticker = await self.futures_exchange.fetch_ticker(ccxt_symbol)
+        # Define async tasks
+        async def fetch_ticker():
+            return await self.futures_exchange.fetch_ticker(ccxt_symbol)
         
-        # Fetch funding rate from CCXT
+        async def fetch_funding():
+            try:
+                return await self.futures_exchange.fetch_funding_rate(ccxt_symbol)
+            except Exception as e:
+                print(f"[{self.cex_name}] Failed to fetch funding rate for {symbol}: {e}")
+                return None
+        
+        async def fetch_premium_index():
+            try:
+                client = await self._get_httpx_client()
+                resp = await client.get(f"https://fapi.asterdex.com/fapi/v1/premiumIndex?symbol={aster_symbol}")
+                return resp.json() if resp.status_code == 200 else None
+            except Exception:
+                return None
+        
+        async def fetch_funding_info():
+            try:
+                client = await self._get_httpx_client()
+                resp = await client.get("https://fapi.asterdex.com/fapi/v1/fundingInfo")
+                return resp.json() if resp.status_code == 200 else None
+            except Exception:
+                return None
+        
+        # Execute all requests in parallel
+        ticker, funding_info, premium_data, funding_info_data = await asyncio.gather(
+            fetch_ticker(), fetch_funding(), fetch_premium_index(), fetch_funding_info()
+        )
+        
+        # Debug: log raw ticker data
+        if os.getenv('DEBUG_TICKER'):
+            logger.warning(f"[aster] FUTURES ticker for {symbol}: {ticker}")
+        
+        # Parse funding rate
         funding_rate = None
-        try:
-            funding_info = await self.futures_exchange.fetch_funding_rate(ccxt_symbol)
-            funding_rate = Decimal(str(funding_info['fundingRate'])) if funding_info.get('fundingRate') else None
-        except Exception as e:
-            print(f"[{self.cex_name}] Failed to fetch funding rate for {symbol}: {e}")
+        if funding_info and funding_info.get('fundingRate'):
+            funding_rate = Decimal(str(funding_info['fundingRate']))
         
-        # Fetch mark/index price and funding interval from Aster API using httpx
+        # Parse mark/index from premium index
         mark_price = None
         index_price = None
+        if premium_data:
+            mark_price = Decimal(str(premium_data['markPrice'])) if premium_data.get('markPrice') else None
+            index_price = Decimal(str(premium_data['indexPrice'])) if premium_data.get('indexPrice') else None
+        
+        # Parse funding interval
         funding_interval = None
-        try:
-            # Convert symbol to Aster format (BTC/USDT:USDT -> BTCUSDT)
-            parts = symbol.upper().split('_')
-            aster_symbol = f"{parts[0]}{parts[1]}" if len(parts) == 2 else symbol.replace('/', '').replace(':', '')
-            
-            client = await self._get_httpx_client()
-            
-            # Get markPrice, indexPrice from premiumIndex
-            resp1 = await client.get(f"https://fapi.asterdex.com/fapi/v1/premiumIndex?symbol={aster_symbol}")
-            if resp1.status_code == 200:
-                data1 = resp1.json()
-                mark_price = Decimal(str(data1['markPrice'])) if data1.get('markPrice') else None
-                index_price = Decimal(str(data1['indexPrice'])) if data1.get('indexPrice') else None
-            
-            # Get fundingIntervalHours from fundingInfo endpoint
-            resp2 = await client.get("https://fapi.asterdex.com/fapi/v1/fundingInfo")
-            if resp2.status_code == 200:
-                data2 = resp2.json()
-                for item in data2:
-                    if item.get('symbol') == aster_symbol:
-                        if item.get('fundingIntervalHours'):
-                            funding_interval = f"{item['fundingIntervalHours']}h"
-                        break
-        except Exception as e:
-            print(f"[{self.cex_name}] Failed to fetch Aster API data for {symbol}: {e}")
+        if funding_info_data:
+            for item in funding_info_data:
+                if item.get('symbol') == aster_symbol and item.get('fundingIntervalHours'):
+                    funding_interval = f"{item['fundingIntervalHours']}h"
+                    break
+        
+        # Parse bid/ask/last and calculate mid price
+        last_price = Decimal(str(ticker['last'])) if ticker.get('last') else None
+        best_bid = Decimal(str(ticker['bid'])) if ticker.get('bid') else None
+        best_ask = Decimal(str(ticker['ask'])) if ticker.get('ask') else None
+        price = calculate_mid_price(best_bid, best_ask, last_price)
         
         return FuturesData(
-            price=Decimal(str(ticker['last'])) if ticker.get('last') else None,
+            price=price,
             index_price=index_price,
             mark_price=mark_price,
             funding_rate=funding_rate,
@@ -933,6 +1077,7 @@ class BinanceAlphaCollector(CexBase):
     async def get_spot_price(self, symbol: str, alpha_id: str = None) -> SpotData:
         """
         Fetch spot price from Binance Alpha ticker API
+        Note: Binance Alpha API doesn't provide bid/ask, only lastPrice
         
         Args:
             symbol: Unified symbol (e.g., "gorilla_usdt" or "175_usdt")
@@ -957,11 +1102,17 @@ class BinanceAlphaCollector(CexBase):
             
             if resp.status_code == 200:
                 result = resp.json()
+                
+                # Debug: log raw ticker data
+                if os.getenv('DEBUG_TICKER'):
+                    logger.warning(f"[alpha] SPOT ticker for {symbol}: {result}")
+                
                 if result.get('success') and result.get('data'):
                     data = result['data']
+                    # Binance Alpha only provides lastPrice, no bid/ask
                     return SpotData(
                         price=Decimal(str(data['lastPrice'])) if data.get('lastPrice') else None,
-                        best_bid=None,  # Binance Alpha ticker doesn't provide bid/ask
+                        best_bid=None,
                         best_ask=None,
                     )
             
